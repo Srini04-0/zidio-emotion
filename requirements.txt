@@ -1,0 +1,8 @@
+streamlit
+pandas
+numpy
+altair
+joblib
+transformers
+scikit-learn
+torch  # Required for Hugging Face Transformers (if not already installed)
