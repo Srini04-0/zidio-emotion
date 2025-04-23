@@ -4,435 +4,684 @@ import numpy as np
 import altair as alt
 import joblib
 import time
-from transformers import pipeline
 import os
 import cv2
 from PIL import Image
-from deepface import DeepFace
 import tempfile
 import librosa
-import soundfile as sf
-import os
-os.environ["USE_TF"] = "0"
+import torch
+from transformers import Wav2Vec2FeatureExtractor, Wav2Vec2ForSequenceClassification
+from tensorflow.keras.models import load_model
+from tensorflow.keras.preprocessing.image import img_to_array
 
+# ==============================================
+# INITIALIZATION & CONFIGURATION
+# ==============================================
 
-# Set page configuration with Zidio branding
+# Constants
+HR_CSV = "HR_alert.csv"
+STRESS_CSV = "stress_history.csv"
+os.environ["TF_USE_LEGACY_KERAS"] = "1"
+
+# Set page configuration
 st.set_page_config(
-    page_title="Zidio AI-Powered Task Optimizer",
+    page_title="Emotion & Stress Detector", 
+    layout="wide",
     page_icon="🧠",
-    layout="centered"
+    initial_sidebar_state="expanded"
 )
 
-# Load Pretrained Emotion Detection Model
-emotion_classifier = pipeline("text-classification", model="bhadresh-savani/distilbert-base-uncased-emotion", return_all_scores=True)
+# Custom CSS
+st.markdown("""
+<style>
+    .st-emotion-card {
+        border-radius: 10px;
+        padding: 20px;
+        margin-bottom: 20px;
+        background-color: #ffffff;
+        box-shadow: 0 4px 6px rgba(0,0,0,0.1);
+    }
+    .st-recommendation {
+        background-color: #f8f9fa;
+        border-left: 4px solid #4e73df;
+        padding: 10px;
+        margin: 10px 0;
+    }
+    .st-alert {
+        padding: 15px;
+        border-radius: 5px;
+        margin: 10px 0;
+    }
+    .st-alert-success {
+        background-color: #d4edda;
+        color: #155724;
+    }
+    .st-alert-warning {
+        background-color: #fff3cd;
+        color: #856404;
+    }
+    .st-alert-danger {
+        background-color: #f8d7da;
+        color: #721c24;
+    }
+    .camera-feed {
+        border-radius: 10px;
+        overflow: hidden;
+    }
+</style>
+""", unsafe_allow_html=True)
 
-# Load ML model for emotion detection
-pipe_lr = joblib.load(open("/workspaces/Emotion-zidio/svm_model1.pkl", "rb"))
-
-# Stress dataset path
-STRESS_CSV = "stress_log.csv"
-
-# Emotion dictionary with emojis
+# Emotion dictionary with emojis and colors
 emotions_emoji_dict = {
-    "anger": "😠", "disgust": "🤮", "fear": "😨😱", "happy": "🤗",
-    "joy": "😂", "neutral": "😐", "sad": "😔", "sadness": "😔",
-    "shame": "😳", "surprise": "😮", "angry": "😠", "surprise": "😮"
+    "anger": {"emoji": "😠", "color": "#dc3545"},
+    "disgust": {"emoji": "🤮", "color": "#28a745"},
+    "fear": {"emoji": "😨", "color": "#6c757d"},
+    "happy": {"emoji": "😊", "color": "#ffc107"},
+    "joy": {"emoji": "😂", "color": "#fd7e14"},
+    "sad": {"emoji": "😔", "color": "#17a2b8"},
+    "neutral": {"emoji": "😐", "color": "#6c757d"},
+    "angry": {"emoji": "😠", "color": "#dc3545"},
+    "calm": {"emoji": "😌", "color": "#28a745"},
+    "surprise": {"emoji": "😮", "color": "#6610f2"}
 }
 
-# Function to predict emotion
-def predict_emotions(docx):
-    result = pipe_lr.predict([docx])
-    return result[0]
-
-# Function to get prediction probabilities
-def get_prediction_proba(docx):
-    results = pipe_lr.predict_proba([docx])
-    return results
-
-# Function to classify stress level
-def classify_stress(text):
-    if not text.strip():
-        return None
-
-    predictions = emotion_classifier(text)[0]
+# Initialize data storage
+def init_data_storage():
+    if not os.path.exists(HR_CSV) or os.path.getsize(HR_CSV) == 0:
+        pd.DataFrame(columns=["timestamp", "user_id", "alert_type", "message"]).to_csv(HR_CSV, index=False)
     
-    # Define words that should indicate high stress
-    high_stress_keywords = ["dying", "death", "panic", "anxiety", "suicide", "hopeless", "fearful", "danger"]
+    if not os.path.exists(STRESS_CSV) or os.path.getsize(STRESS_CSV) == 0:
+        pd.DataFrame(columns=["user_id", "timestamp", "text", "stress_level"]).to_csv(STRESS_CSV, index=False)
+    
+    if 'stress_history' not in st.session_state:
+        st.session_state.stress_history = pd.read_csv(STRESS_CSV) if os.path.exists(STRESS_CSV) else pd.DataFrame(columns=["user_id", "timestamp", "text", "stress_level"])
+    
+    if 'hr_alerts' not in st.session_state:
+        st.session_state.hr_alerts = pd.read_csv(HR_CSV) if os.path.exists(HR_CSV) else pd.DataFrame(columns=["timestamp", "user_id", "alert_type", "message"])
 
-    # Check if the text contains high-stress words
-    text_lower = text.lower()
-    if any(word in text_lower for word in high_stress_keywords):
-        return "Severe"
+init_data_storage()
 
-    # Calculate stress score based on emotion model
-    stress_score = sum([p['score'] for p in predictions if p['label'] in ['fear', 'anger', 'sadness']])
+# ==============================================
+# MODEL LOADING (YOUR CUSTOM MODELS + VOICE PRE-TRAINED)
+# ==============================================
 
-    # Adjusted stress level thresholds
-    if stress_score < 0.3:
+@st.cache_resource
+def load_models():
+    # Load your custom text model
+    text_model = joblib.load("svm_model1.pkl")
+    
+    # Load your custom facial emotion model
+    facial_emotion_model = load_model("emotion_detection_model.h5")
+    
+    # Load pre-trained voice model only
+    voice_model = Wav2Vec2ForSequenceClassification.from_pretrained("ehcalabres/wav2vec2-lg-xlsr-en-speech-emotion-recognition")
+    voice_feature_extractor = Wav2Vec2FeatureExtractor.from_pretrained("ehcalabres/wav2vec2-lg-xlsr-en-speech-emotion-recognition")
+    
+    return text_model, facial_emotion_model, voice_model, voice_feature_extractor
+
+text_model, facial_emotion_model, voice_model, voice_feature_extractor = load_models()
+
+# ==============================================
+# CORE FUNCTIONS
+# ==============================================
+
+def predict_emotions(text):
+    # Use your custom SVM model
+    return text_model.predict([text])[0]
+
+def get_prediction_proba(text):
+    # Get probabilities from your SVM model
+    proba = text_model.predict_proba([text])[0]
+    return dict(zip(text_model.classes_, proba))
+
+def classify_stress(text):
+    emotion = predict_emotions(text)
+    if emotion in ["happy", "calm", "neutral"]:
         return "No Stress"
-    elif stress_score < 0.6:
+    elif emotion in ["sad", "surprise"]:
         return "Mild"
-    elif stress_score < 0.85:
+    elif emotion in ["fear", "disgust"]:
         return "Moderate"
     else:
         return "Severe"
 
-# Function to recommend tasks based on emotion
 def recommend_task(emotion):
     task_rules = {
         "fear": ["Practice deep breathing", "Talk to a mentor for reassurance"],
         "happy": ["Focus on creative tasks", "Collaborate with team"],
-        "sad": ["Listen to a motivational podcast", "Review recent achievements"],
-        "neutral": ["Prioritize high-priority tasks", "Schedule a team check-in"],
-        "angry": ["Take a short walk", "Practice mindfulness"],
-        "surprise": ["Reflect on what surprised you", "Journal about the experience"]
+        "sad": ["Listen to uplifting music", "Call a friend"],
+        "neutral": ["Prioritize important tasks", "Take a mindful break"],
+        "angry": ["Take deep breaths", "Go for a walk"],
+        "surprise": ["Reflect on what surprised you", "Journal about it"],
+        "calm": ["Maintain your routine", "Help others"],
+        "disgust": ["Remove yourself from the situation", "Practice grounding techniques"]
     }
-    return task_rules.get(emotion, ["No recommendation available"])
+    return task_rules.get(emotion, ["No specific recommendation"])
 
-# Function to log stress level in a dataset
 def log_stress(user_id, text, stress_level):
     timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
-
     new_entry = pd.DataFrame([[user_id, timestamp, text, stress_level]], 
-                             columns=["user_id", "timestamp", "text", "stress_level"])
+                           columns=["user_id", "timestamp", "text", "stress_level"])
     
-    if os.path.exists(STRESS_CSV):
-        df = pd.read_csv(STRESS_CSV)
-        df = pd.concat([df, new_entry], ignore_index=True)
-    else:
-        df = new_entry
+    st.session_state.stress_history = pd.concat([st.session_state.stress_history, new_entry], ignore_index=True)
+    new_entry.to_csv(STRESS_CSV, mode='a', header=not os.path.exists(STRESS_CSV), index=False)
 
-    df.to_csv(STRESS_CSV, index=False)
-
-# Function to analyze stress history and trends
-def analyze_stress_history(user_id):
-    if not os.path.exists(STRESS_CSV):
-        return None
-
-    df = pd.read_csv(STRESS_CSV)
-    user_data = df[df["user_id"] == user_id]
-
-    if user_data.empty:
-        return None
-
-    stress_counts = user_data["stress_level"].value_counts().reset_index()
-    stress_counts.columns = ["stress_level", "count"]
-
-    return stress_counts
-
-# Function for facial emotion detection
 def analyze_facial_emotion(image_path):
     try:
-        result = DeepFace.analyze(img_path=image_path, actions=['emotion'], enforce_detection=False)
-        dominant_emotion = result[0]['dominant_emotion']
-        emotion_scores = result[0]['emotion']
-        return dominant_emotion, emotion_scores
+        image = cv2.imread(image_path)
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        
+        # Face detection
+        face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
+        faces = face_cascade.detectMultiScale(gray, 1.3, 5)
+        
+        if len(faces) == 0:
+            return None, "No face detected"
+        
+        (x, y, w, h) = faces[0]
+        roi = gray[y:y+h, x:x+w]
+        roi = cv2.resize(roi, (48, 48))
+        roi = roi.astype("float") / 255.0
+        roi = np.expand_dims(roi, axis=0)
+        
+        # Predict with your custom model
+        predictions = facial_emotion_model.predict(roi)[0]
+        emotion_labels = ['angry', 'disgust', 'fear', 'happy', 'neutral', 'sad', 'surprise']
+        dominant_emotion = emotion_labels[np.argmax(predictions)]
+        emotion_probs = {emotion: float(prob) for emotion, prob in zip(emotion_labels, predictions)}
+        
+        return dominant_emotion, emotion_probs
     except Exception as e:
         return None, str(e)
 
-# Function for speech emotion detection
 def analyze_speech_emotion(audio_path):
     try:
-        # Load audio file
-        y, sr = librosa.load(audio_path, sr=None)
+        y, sr = librosa.load(audio_path, sr=16000)
+        inputs = voice_feature_extractor(y, sampling_rate=16000, return_tensors="pt", padding=True)
         
-        # Extract features (simplified example - in practice you'd use a pre-trained model)
-        mfccs = librosa.feature.mfcc(y=y, sr=sr, n_mfcc=40)
-        mfccs_mean = np.mean(mfccs.T, axis=0)
+        with torch.no_grad():
+            logits = voice_model(**inputs).logits
+            predicted_class_id = int(torch.argmax(logits))
+            scores = torch.nn.functional.softmax(logits, dim=1)[0].numpy()
         
-        # This is a placeholder - in a real app you'd use a trained model
-        emotions = ['neutral', 'happy', 'sad', 'angry', 'fearful']
-        fake_probs = np.random.dirichlet(np.ones(5), size=1)[0]
-        dominant_emotion = emotions[np.argmax(fake_probs)]
+        emotion_labels = ['angry', 'calm', 'happy', 'sad']
+        dominant_emotion = emotion_labels[predicted_class_id]
+        emotion_probs = {emotion: float(prob) for emotion, prob in zip(emotion_labels, scores)}
         
-        return dominant_emotion, dict(zip(emotions, fake_probs))
+        return dominant_emotion, emotion_probs
     except Exception as e:
         return None, str(e)
 
-# Main App with Zidio Branding
-st.markdown(
-    """
-    <style>
-    .big-font {
-        font-size:36px !important;
-        font-weight: bold;
-        color: #4a4a4a;
-    }
-    .feature-card {
-        padding: 20px;
-        border-radius: 10px;
-        background-color: #f8f9fa;
-        margin-bottom: 15px;
-        box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
-    }
-    .feature-title {
-        font-size: 20px;
-        font-weight: bold;
-        color: #2c3e50;
-    }
-    </style>
-    """,
-    unsafe_allow_html=True
-)
-
-# Header with Zidio branding
-st.markdown('<div class="big-font">Zidio AI-Powered Task Optimizer</div>', unsafe_allow_html=True)
-st.markdown("""
-Welcome to the Zidio AI-Powered Task Optimizer!
-
-The system analyzes employee emotions and provides insights to recommend tasks and detect stress or negative moods.
-""")
-
-# Feature cards like in the image
-col1, col2 = st.columns(2)
-
-with col1:
-    with st.container():
-        st.markdown('<div class="feature-card"><div class="feature-title">Real-Time Emotion Detection</div>Analyses text, video, and speech in real-time to detect employee emotions</div>', unsafe_allow_html=True)
+def add_hr_alert(user_id, alert_type, message):
+    timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
+    new_alert = pd.DataFrame([[timestamp, user_id, alert_type, message]],
+                           columns=["timestamp", "user_id", "alert_type", "message"])
     
-    with st.container():
-        st.markdown('<div class="feature-card"><div class="feature-title">Task Recommendation</div>Suggests tasks based on an employee\'s detected mood</div>', unsafe_allow_html=True)
+    st.session_state.hr_alerts = pd.concat([st.session_state.hr_alerts, new_alert], ignore_index=True)
+    new_alert.to_csv(HR_CSV, mode='a', header=not os.path.exists(HR_CSV), index=False)
+
+def check_hr_alerts():
+    alerts = pd.concat([
+        st.session_state.hr_alerts,
+        pd.read_csv(HR_CSV) if os.path.exists(HR_CSV) else pd.DataFrame()
+    ]).drop_duplicates()
     
-    with st.container():
-        st.markdown('<div class="feature-card"><div class="feature-title">Historical Mood Tracking</div>Tracks each employee\'s mood over time to identify patterns</div>', unsafe_allow_html=True)
-
-with col2:
-    with st.container():
-        st.markdown('<div class="feature-card"><div class="feature-title">Stress Management Alert</div>Notifies HR or managers when prolonged stress or disengagement</div>', unsafe_allow_html=True)
+    if alerts.empty:
+        st.success("No active HR alerts")
+        return
     
-    with st.container():
-        st.markdown('<div class="feature-card"><div class="feature-title">Team Mood Analytics</div>Identifies team morale and productivity trends through mood data</div>', unsafe_allow_html=True)
-    
-    with st.container():
-        st.markdown('<div class="feature-card"><div class="feature-title">Data Privacy</div>Ensures that all sensitive employee data is anonymized and securely stored</div>', unsafe_allow_html=True)
-
-# Tabs for different features
-st.markdown("---")
-st.subheader("Employee Emotion Analysis Tools")
-
-tab1, tab2, tab3, tab4 = st.tabs([
-    "📝 Text Analysis", 
-    "⚠️ Stress Detection", 
-    "📈 Mood History",
-    "🎭 Multi-Modal Analysis"
-])
-
-# Tab 1: Emotion Detection
-with tab1:
-    st.subheader("Text Emotion Analysis")
-
-    with st.form(key='emotion_form'):
-        raw_text = st.text_area("Enter employee text for analysis", placeholder="Type or paste text here...")
-        submit_text = st.form_submit_button(label='Analyze Emotion')
-
-    if submit_text:
-        prediction = predict_emotions(raw_text)
-        probability = get_prediction_proba(raw_text)
-
-        col1, col2 = st.columns(2)
-
-        with col1:
-            st.success("Analysis Results")
-            emoji_icon = emotions_emoji_dict.get(prediction, "❓")
-            st.write(f"**Dominant Emotion:** {prediction.capitalize()} {emoji_icon}")
-            st.write(f"**Confidence:** {np.max(probability)*100:.1f}%")
-
-            # Task Recommendation
-            st.success("Recommended Tasks")
-            recommendations = recommend_task(prediction)
-            for task in recommendations:
-                st.write(f"• {task}")
-
-        with col2:
-            st.success("Emotion Distribution")
-            proba_df = pd.DataFrame(probability, columns=pipe_lr.classes_)
-            proba_df_clean = proba_df.T.reset_index()
-            proba_df_clean.columns = ["emotions", "probability"]
-
-            fig = alt.Chart(proba_df_clean).mark_bar().encode(
-                x='emotions',
-                y='probability',
-                color='emotions'
-            ).properties(height=300)
-            st.altair_chart(fig, use_container_width=True)
-
-# Tab 2: Stress Level Detector
-with tab2:
-    st.subheader("Employee Stress Detection")
-
-    user_id = st.text_input("Employee ID", placeholder="Enter employee ID for tracking")
-    user_text = st.text_area("Text for stress analysis", placeholder="Enter text to analyze stress level...")
-
-    if st.button("Analyze Stress Level"):
-        if user_id.strip() == "":
-            st.error("Please enter an Employee ID")
+    st.subheader("HR Alert Dashboard")
+    for _, row in alerts.iterrows():
+        if row['alert_type'] == "critical":
+            st.markdown(f"""
+            <div class="st-alert st-alert-danger">
+                <h3>🚨 Critical Alert</h3>
+                <p><strong>User:</strong> {row['user_id']}</p>
+                <p><strong>Time:</strong> {row['timestamp']}</p>
+                <p><strong>Message:</strong> {row['message']}</p>
+            </div>
+            """, unsafe_allow_html=True)
         else:
-            stress_level = classify_stress(user_text)
+            st.markdown(f"""
+            <div class="st-alert st-alert-warning">
+                <h3>⚠️ Warning Alert</h3>
+                <p><strong>User:</strong> {row['user_id']}</p>
+                <p><strong>Time:</strong> {row['timestamp']}</p>
+                <p><strong>Message:</strong> {row['message']}</p>
+            </div>
+            """, unsafe_allow_html=True)
 
-            if stress_level:
-                if stress_level == "No Stress":
-                    st.success("✅ No significant stress detected")
-                elif stress_level == "Mild":
-                    st.warning("⚠️ Mild Stress Detected")
-                    st.info("**Recommendation:** Employee might benefit from a short break or check-in")
-                elif stress_level == "Moderate":
-                    st.error("⚠️ Moderate Stress Alert")
-                    st.info("**Recommendation:** Consider workload adjustment and support resources")
-                elif stress_level == "Severe":
-                    st.error("🚨 Severe Stress Alert")
-                    st.info("**Action Required:** Immediate manager/HR notification recommended")
+def clear_alerts():
+    st.session_state.hr_alerts = pd.DataFrame(columns=["timestamp", "user_id", "alert_type", "message"])
+    pd.DataFrame(columns=["timestamp", "user_id", "alert_type", "message"]).to_csv(HR_CSV, index=False)
+    st.success("All alerts cleared")
 
-                # Log stress level
-                log_stress(user_id, user_text, stress_level)
+# ==============================================
+# STREAMLIT UI COMPONENTS
+# ==============================================
 
-                # Show stress history
-                stress_history = analyze_stress_history(user_id)
-                if stress_history is not None:
-                    st.subheader("Stress History Overview")
-                    st.bar_chart(stress_history.set_index("stress_level"))
-                else:
-                    st.info("No previous stress records found for this employee")
-
-# Tab 3: Stress History Chart
-with tab3:
-    st.subheader("Employee Mood History")
-
-    history_user_id = st.text_input("Enter Employee ID", placeholder="Employee ID to view history")
-
-    if st.button("View Mood History"):
-        if history_user_id.strip() == "":
-            st.error("Please enter an Employee ID")
-        else:
-            if os.path.exists(STRESS_CSV):
-                df = pd.read_csv(STRESS_CSV)
-                user_data = df[df["user_id"] == history_user_id]
-
-                if user_data.empty:
-                    st.info("No mood history found for this employee")
-                else:
-                    st.success(f"Mood history for employee {history_user_id}")
+def sidebar():
+    with st.sidebar:
+        st.image("https://img.icons8.com/fluency/96/brain.png", width=80)
+        st.title("Quick Actions")
+        
+        user_id = st.text_input("Your User ID", key="sidebar_user_id", placeholder="user123")
+        
+        st.markdown("---")
+        
+        st.subheader("Quick Analysis")
+        quick_text = st.text_area("How are you feeling today?", key="quick_text", height=100)
+        
+        if st.button("Quick Check"):
+            if quick_text.strip():
+                with st.spinner("Analyzing..."):
+                    emotion = predict_emotions(quick_text)
+                    stress = classify_stress(quick_text)
+                    probabilities = get_prediction_proba(quick_text)
                     
-                    user_data["timestamp"] = pd.to_datetime(user_data["timestamp"])
-
-                    # Display Table
-                    st.dataframe(user_data)
-
-                    # Plot Stress Trends Over Time
-                    chart = alt.Chart(user_data).mark_line(point=True).encode(
-                        x='timestamp:T',
-                        y=alt.Y('stress_level:N', sort=['No Stress', 'Mild', 'Moderate', 'Severe']),
-                        color='stress_level',
-                        tooltip=['timestamp', 'stress_level']
-                    ).properties(
-                        title="Stress Level Trend",
-                        height=400
-                    )
+                    chart = alt.Chart(
+                        pd.DataFrame.from_dict(probabilities, orient='index', columns=['probability']).reset_index()
+                    ).mark_bar().encode(
+                        x='index',
+                        y='probability',
+                        color=alt.Color('index', scale=alt.Scale(
+                            domain=list(emotions_emoji_dict.keys()),
+                            range=[v['color'] for v in emotions_emoji_dict.values()]
+                        ))
+                    ).properties(height=300)
+                    
                     st.altair_chart(chart, use_container_width=True)
+                    
+                    emoji = emotions_emoji_dict.get(emotion.lower(), {}).get("emoji", "❓")
+                    st.success(f"**Emotion:** {emotion.capitalize()} {emoji}")
+                    
+                    if stress == "No Stress":
+                        st.success(f"**Stress Level:** {stress}")
+                    elif stress == "Mild":
+                        st.warning(f"**Stress Level:** {stress}")
+                    else:
+                        st.error(f"**Stress Level:** {stress}")
             else:
-                st.warning("No mood records found yet")
+                st.warning("Please enter some text to analyze")
+        
+        st.markdown("---")
+        
+        st.subheader("Navigation")
+        page = st.radio("Go to:", 
+                       ["Emotion Detection", 
+                        "Stress Analysis", 
+                        "My Stress History", 
+                        "Live Detection",
+                        "HR Alerts"])
+        
+        st.markdown("---")
+        
+        if st.button("Check HR Alerts"):
+            check_hr_alerts()
+    
+    return page
 
-# Tab 4: Face & Voice Analysis
-with tab4:
-    st.subheader("Multi-Modal Emotion Analysis")
+def emotion_detection_page():
+    st.title("😃 Emotion Detection")
     
-    analysis_option = st.selectbox("Select analysis mode:", ["Facial Expression", "Voice Tone", "Both"])
+    col1, col2 = st.columns([2, 1])
     
-    if analysis_option in ["Facial Expression", "Both"]:
-        st.subheader("Facial Emotion Analysis")
-        face_option = st.radio("Input method:", ["Upload Image", "Use Webcam"])
-        
-        if face_option == "Upload Image":
-            uploaded_file = st.file_uploader("Upload employee photo", type=["jpg", "png", "jpeg"])
+    with col1:
+        with st.container():
+            st.subheader("Text Analysis")
+            raw_text = st.text_area("Express your feelings...", height=150, key="emotion_text")
             
-            if uploaded_file is not None:
-                image = Image.open(uploaded_file)
-                st.image(image, caption='Uploaded Image', use_column_width=True)
-                
-                with tempfile.NamedTemporaryFile(delete=False, suffix=".jpg") as tmp_file:
-                    image.save(tmp_file.name)
-                    dominant_emotion, emotion_scores = analyze_facial_emotion(tmp_file.name)
-                
-                if dominant_emotion:
-                    col1, col2 = st.columns(2)
-                    
-                    with col1:
-                        st.success("Detected Emotion")
-                        emoji_icon = emotions_emoji_dict.get(dominant_emotion.lower(), "❓")
-                        st.write(f"**Dominant Emotion:** {dominant_emotion.capitalize()} {emoji_icon}")
+            if st.button("Analyze Emotion"):
+                if raw_text.strip():
+                    with st.spinner("Detecting emotion..."):
+                        prediction = predict_emotions(raw_text)
+                        probability = get_prediction_proba(raw_text)
                         
-                        st.success("Recommended Tasks")
-                        recommendations = recommend_task(dominant_emotion.lower())
-                        for task in recommendations:
-                            st.write(f"• {task}")
-                    
-                    with col2:
-                        st.success("Emotion Distribution")
-                        emotion_data = pd.DataFrame.from_dict(emotion_scores, orient='index', columns=['score'])
-                        st.bar_chart(emotion_data)
+                        emoji_icon = emotions_emoji_dict.get(prediction.lower(), {}).get("emoji", "❓")
+                        color = emotions_emoji_dict.get(prediction.lower(), {}).get("color", "#6c757d")
+                        
+                        st.markdown(f"""
+                        <div class="st-emotion-card" style="border-left: 5px solid {color};">
+                            <h3>Detected Emotion: {prediction.capitalize()} {emoji_icon}</h3>
+                            <p>Confidence: {max(probability.values())*100:.1f}%</p>
+                        </div>
+                        """, unsafe_allow_html=True)
+                        
+                        proba_df = pd.DataFrame.from_dict(probability, orient='index', columns=['probability'])
+                        st.bar_chart(proba_df)
+                        
+                        st.subheader("Recommended Actions")
+                        for task in recommend_task(prediction.lower()):
+                            st.markdown(f"""
+                            <div class="st-recommendation">
+                                <p>✅ {task}</p>
+                            </div>
+                            """, unsafe_allow_html=True)
+                        
+                        if prediction.lower() in ["anger", "fear"] and max(probability.values()) > 0.8:
+                            add_hr_alert(
+                                st.session_state.sidebar_user_id,
+                                "critical",
+                                f"High {prediction} detected in text (confidence: {max(probability.values()):.0%})"
+                            )
                 else:
-                    st.error(f"Analysis error: {emotion_scores}")
-        else:  # Webcam option
-            picture = st.camera_input("Capture employee photo")
-            
-            if picture:
-                image = Image.open(picture)
-                with tempfile.NamedTemporaryFile(delete=False, suffix=".jpg") as tmp_file:
-                    image.save(tmp_file.name)
-                    dominant_emotion, emotion_scores = analyze_facial_emotion(tmp_file.name)
-                    
-                if dominant_emotion:
-                    col1, col2 = st.columns(2)
-                    
-                    with col1:
-                        st.image(image, caption='Captured Image', use_column_width=True)
-                    
-                    with col2:
-                        st.success("Detected Emotion")
-                        emoji_icon = emotions_emoji_dict.get(dominant_emotion.lower(), "❓")
-                        st.write(f"**Dominant Emotion:** {dominant_emotion.capitalize()} {emoji_icon}")
-                        
-                        st.success("Emotion Scores")
-                        emotion_data = pd.DataFrame.from_dict(emotion_scores, orient='index', columns=['score'])
-                        st.bar_chart(emotion_data)
-                        
-                        st.success("Recommended Tasks")
-                        recommendations = recommend_task(dominant_emotion.lower())
-                        for task in recommendations:
-                            st.write(f"• {task}")
-                else:
-                    st.error(f"Analysis error: {emotion_scores}")
+                    st.warning("Please enter some text to analyze")
+
+def stress_analysis_page():
+    st.title("🧘 Stress Level Analysis")
     
-    if analysis_option in ["Voice Tone", "Both"]:
-        st.subheader("Voice Emotion Analysis")
-        audio_file = st.file_uploader("Upload employee voice recording", type=["wav", "mp3"])
+    with st.container():
+        st.subheader("Stress Detection")
+        user_text = st.text_area("What's on your mind?", height=150, key="stress_text")
         
-        if audio_file is not None:
-            st.audio(audio_file, format='audio/wav')
+        if st.button("Analyze Stress Level"):
+            if st.session_state.sidebar_user_id.strip() == "":
+                st.error("Please enter your User ID in the sidebar first")
+            elif user_text.strip():
+                with st.spinner("Analyzing stress level..."):
+                    stress_level = classify_stress(user_text)
+                    
+                    alert_class = "st-alert-success" if stress_level == "No Stress" else \
+                                "st-alert-warning" if stress_level in ["Mild", "Moderate"] else \
+                                "st-alert-danger"
+                    
+                    stress_messages = {
+                        "No Stress": "You seem to be doing well!",
+                        "Mild": "Consider taking a short break and practicing deep breathing.",
+                        "Moderate": "Try relaxation techniques like meditation or a short walk.",
+                        "Severe": "Please consider reaching out for professional support."
+                    }
+                    
+                    st.markdown(f"""
+                    <div class="st-alert {alert_class}">
+                        <h3>Stress Level: {stress_level}</h3>
+                        <p>{stress_messages[stress_level]}</p>
+                    </div>
+                    """, unsafe_allow_html=True)
+                    
+                    log_stress(st.session_state.sidebar_user_id, user_text, stress_level)
+                    
+                    if stress_level in ["Moderate", "Severe"]:
+                        add_hr_alert(
+                            st.session_state.sidebar_user_id,
+                            "warning" if stress_level == "Moderate" else "critical",
+                            f"{stress_level} stress level detected"
+                        )
+                    
+                    st.subheader("Your Stress History")
+                    user_data = st.session_state.stress_history[
+                        st.session_state.stress_history["user_id"] == st.session_state.sidebar_user_id
+                    ]
+                    
+                    if not user_data.empty:
+                        st.bar_chart(user_data["stress_level"].value_counts())
+                    else:
+                        st.info("No stress history found for this user.")
+            else:
+                st.warning("Please enter some text to analyze")
+
+def stress_history_page():
+    st.title("📊 My Stress History")
+    
+    if st.session_state.sidebar_user_id.strip() == "":
+        st.warning("Please enter your User ID in the sidebar to view your history")
+    else:
+        with st.spinner("Loading your history..."):
+            user_data = st.session_state.stress_history[
+                st.session_state.stress_history["user_id"] == st.session_state.sidebar_user_id
+            ]
             
-            with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp_file:
-                tmp_file.write(audio_file.read())
-                dominant_emotion, emotion_scores = analyze_speech_emotion(tmp_file.name)
-            
-            if dominant_emotion:
-                col1, col2 = st.columns(2)
+            if user_data.empty:
+                st.info("No stress history found. Start by analyzing your stress in the Stress Analysis section.")
+            else:
+                col1, col2, col3 = st.columns(3)
+                total_entries = len(user_data)
+                most_common = user_data["stress_level"].value_counts().index[0]
                 
                 with col1:
-                    st.success("Detected Emotion")
-                    emoji_icon = emotions_emoji_dict.get(dominant_emotion.lower(), "❓")
-                    st.write(f"**Dominant Emotion:** {dominant_emotion.capitalize()} {emoji_icon}")
-                    
-                    st.success("Recommended Tasks")
-                    recommendations = recommend_task(dominant_emotion.lower())
-                    for task in recommendations:
-                        st.write(f"• {task}")
-                
+                    st.metric("Total Entries", total_entries)
                 with col2:
-                    st.success("Emotion Distribution")
-                    emotion_data = pd.DataFrame.from_dict(emotion_scores, orient='index', columns=['score'])
-                    st.bar_chart(emotion_data)
-            else:
-                st.error(f"Analysis error: {emotion_scores}")
+                    st.metric("Most Common Level", most_common)
+                with col3:
+                    st.metric("Last Analyzed", "Today" if total_entries > 0 else "Never")
+                
+                st.subheader("Detailed History")
+                st.dataframe(user_data.sort_values("timestamp", ascending=False))
+                
+                st.subheader("Stress Trend Over Time")
+                chart = alt.Chart(user_data).mark_line(point=True).encode(
+                    x='timestamp:T',
+                    y=alt.Y('stress_level:N', sort=['No Stress', 'Mild', 'Moderate', 'Severe']),
+                    color='stress_level',
+                    tooltip=['timestamp', 'stress_level', 'text']
+                ).properties(height=400)
+                st.altair_chart(chart, use_container_width=True)
 
-# Footer
-st.markdown("---")
-st.markdown("**Zidio AI-Powered Task Optimizer** - Enhancing workplace productivity through emotional intelligence")
+def live_detection_page():
+    st.title("🎭 Live Emotion Detection")
+    
+    tab1, tab2 = st.tabs(["Facial Expression", "Voice Tone"])
+    
+    with tab1:
+        st.subheader("Real-time Facial Emotion Detection")
+        
+        if 'webcam_active' not in st.session_state:
+            st.session_state.webcam_active = False
+        
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            st.markdown("""
+            ### Instructions
+            1. Click 'Start Webcam' to activate your camera
+            2. Look at the camera and click 'Capture & Analyze'
+            3. View your emotion analysis results
+            """)
+            
+            if st.button("Start Webcam", disabled=st.session_state.webcam_active):
+                st.session_state.webcam_active = True
+            if st.button("Stop Webcam", disabled=not st.session_state.webcam_active):
+                st.session_state.webcam_active = False
+        
+        with col2:
+            if st.session_state.webcam_active:
+                img_file_buffer = st.camera_input("Look at the camera...", key="live_webcam")
+                if img_file_buffer is not None:
+                    with st.spinner("Analyzing your expression..."):
+                        with tempfile.NamedTemporaryFile(delete=False, suffix=".jpg") as tmp_file:
+                            tmp_file.write(img_file_buffer.getvalue())
+                            tmp_path = tmp_file.name
+                        
+                        try:
+                            dominant_emotion, emotion_probs = analyze_facial_emotion(tmp_path)
+                            
+                            if dominant_emotion:
+                                emoji_icon = emotions_emoji_dict.get(dominant_emotion.lower(), {}).get("emoji", "❓")
+                                color = emotions_emoji_dict.get(dominant_emotion.lower(), {}).get("color", "#6c757d")
+                                
+                                st.markdown(f"""
+                                <div class="st-emotion-card" style="border-left: 5px solid {color};">
+                                    <h3>Detected Emotion: {dominant_emotion.capitalize()} {emoji_icon}</h3>
+                                </div>
+                                """, unsafe_allow_html=True)
+                                
+                                prob_df = pd.DataFrame.from_dict(emotion_probs, orient='index', columns=['Probability'])
+                                st.bar_chart(prob_df)
+                                
+                                st.subheader("Recommended Actions")
+                                for task in recommend_task(dominant_emotion.lower()):
+                                    st.markdown(f"""
+                                    <div class="st-recommendation">
+                                        <p>✅ {task}</p>
+                                    </div>
+                                    """, unsafe_allow_html=True)
+                                
+                                if dominant_emotion in ["angry", "fear"]:
+                                    add_hr_alert(
+                                        st.session_state.sidebar_user_id,
+                                        "critical",
+                                        f"Concerning facial emotion detected: {dominant_emotion}"
+                                    )
+                            else:
+                                st.error(f"Error analyzing face: {emotion_probs}")
+                        
+                        except Exception as e:
+                            st.error(f"Error processing image: {str(e)}")
+                        finally:
+                            os.unlink(tmp_path)
+    
+    with tab2:
+        st.subheader("🎙️ Voice Emotion Detection")
+        st.info("Record your voice or upload a file for emotion analysis")
+        
+        # Option selection
+        analysis_option = st.radio(
+            "Choose input method:",
+            ["Record Voice", "Upload Audio File"],
+            horizontal=True
+        )
+        
+        if analysis_option == "Record Voice":
+            from audio_recorder_streamlit import audio_recorder
+            
+            # Audio recorder component
+            audio_bytes = audio_recorder(
+                text="Click to record",
+                recording_color="#e8b62c",
+                neutral_color="#6aa36f",
+                icon_name="user",
+                icon_size="2x",
+            )
+            
+            if audio_bytes:
+                st.audio(audio_bytes, format="audio/wav")
+                
+                if st.button("Analyze Recorded Voice"):
+                    with st.spinner("Analyzing voice emotion..."):
+                        with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp_file:
+                            tmp_file.write(audio_bytes)
+                            tmp_path = tmp_file.name
+                        
+                        try:
+                            dominant_emotion, emotion_probs = analyze_speech_emotion(tmp_path)
+                            
+                            if dominant_emotion:
+                                emoji = emotions_emoji_dict.get(dominant_emotion.lower(), {}).get("emoji", "🎤")
+                                color = emotions_emoji_dict.get(dominant_emotion.lower(), {}).get("color", "#6c757d")
+                                
+                                st.markdown(f"""
+                                <div class="st-emotion-card" style="border-left: 5px solid {color};">
+                                    <h3>Detected Emotion: {dominant_emotion.capitalize()} {emoji}</h3>
+                                </div>
+                                """, unsafe_allow_html=True)
+                                
+                                prob_df = pd.DataFrame({
+                                    "Emotion": list(emotion_probs.keys()),
+                                    "Probability": list(emotion_probs.values())
+                                })
+                                st.bar_chart(prob_df.set_index("Emotion"))
+                                
+                                st.subheader("Recommended Actions")
+                                for task in recommend_task(dominant_emotion.lower()):
+                                    st.markdown(f"""
+                                    <div class="st-recommendation">
+                                        <p>✅ {task}</p>
+                                    </div>
+                                    """, unsafe_allow_html=True)
+                                
+                                if dominant_emotion in ["angry", "sad"]:
+                                    add_hr_alert(
+                                        st.session_state.sidebar_user_id,
+                                        "warning" if dominant_emotion == "sad" else "critical",
+                                        f"Concerning voice emotion detected: {dominant_emotion}"
+                                    )
+                            else:
+                                st.error(f"Error analyzing voice: {emotion_probs}")
+                        
+                        except Exception as e:
+                            st.error(f"Error processing audio: {str(e)}")
+                        finally:
+                            os.unlink(tmp_path)
+        
+        else:  # Upload Audio File
+            uploaded_file = st.file_uploader("Upload a voice clip (wav only)", type=["wav"])
+            
+            if uploaded_file is not None:
+                st.audio(uploaded_file, format='audio/wav')
+                
+                if st.button("Analyze Uploaded Voice"):
+                    with st.spinner("Analyzing voice emotion..."):
+                        with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp_file:
+                            tmp_file.write(uploaded_file.getvalue())
+                            tmp_path = tmp_file.name
+                        
+                        try:
+                            dominant_emotion, emotion_probs = analyze_speech_emotion(tmp_path)
+                            
+                            if dominant_emotion:
+                                emoji = emotions_emoji_dict.get(dominant_emotion.lower(), {}).get("emoji", "🎤")
+                                color = emotions_emoji_dict.get(dominant_emotion.lower(), {}).get("color", "#6c757d")
+                                
+                                st.markdown(f"""
+                                <div class="st-emotion-card" style="border-left: 5px solid {color};">
+                                    <h3>Detected Emotion: {dominant_emotion.capitalize()} {emoji}</h3>
+                                </div>
+                                """, unsafe_allow_html=True)
+                                
+                                prob_df = pd.DataFrame({
+                                    "Emotion": list(emotion_probs.keys()),
+                                    "Probability": list(emotion_probs.values())
+                                })
+                                st.bar_chart(prob_df.set_index("Emotion"))
+                                
+                                st.subheader("Recommended Actions")
+                                for task in recommend_task(dominant_emotion.lower()):
+                                    st.markdown(f"""
+                                    <div class="st-recommendation">
+                                        <p>✅ {task}</p>
+                                    </div>
+                                    """, unsafe_allow_html=True)
+                                
+                                if dominant_emotion in ["angry", "sad"]:
+                                    add_hr_alert(
+                                        st.session_state.sidebar_user_id,
+                                        "warning" if dominant_emotion == "sad" else "critical",
+                                        f"Concerning voice emotion detected: {dominant_emotion}"
+                                    )
+                            else:
+                                st.error(f"Error analyzing voice: {emotion_probs}")
+                        
+                        except Exception as e:
+                            st.error(f"Error processing audio: {str(e)}")
+                        finally:
+                            os.unlink(tmp_path)
+
+def hr_alerts_page():
+    st.title("🛎️ HR Alert Dashboard")
+    
+    check_hr_alerts()
+    
+    if st.button("Clear All Alerts"):
+        clear_alerts()
+        st.experimental_rerun()
+
+# ==============================================
+# MAIN APP FLOW
+# ==============================================
+
+def main():
+    page = sidebar()
+    
+    if page == "Emotion Detection":
+        emotion_detection_page()
+    elif page == "Stress Analysis":
+        stress_analysis_page()
+    elif page == "My Stress History":
+        stress_history_page()
+    elif page == "Live Detection":
+        live_detection_page()
+    elif page == "HR Alerts":
+        hr_alerts_page()
+
+if __name__ == "__main__":
+    main()
